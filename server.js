@@ -3,67 +3,126 @@ const WebSocket = require('ws');
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocket.Server({ port: PORT });
 
-// Store drawing history (limited to prevent memory issues)
+// Store drawing history
 const MAX_HISTORY = 5000;
 let drawHistory = [];
 
+// Store connected users
+const users = {};
+
 console.log(`WebSocket server running on port ${PORT}`);
 
-wss.on('connection', (ws) => {
-    console.log('New client connected. Total:', wss.clients.size);
+function broadcast(data, exclude = null) {
+    const message = JSON.stringify(data);
+    wss.clients.forEach(client => {
+        if (client !== exclude && client.readyState === WebSocket.OPEN) {
+            client.send(message);
+        }
+    });
+}
 
-    // Send existing drawing history to new client
-    if (drawHistory.length > 0) {
-        ws.send(JSON.stringify({
-            type: 'history',
-            strokes: drawHistory
-        }));
-    }
+function broadcastToAll(data) {
+    const message = JSON.stringify(data);
+    wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(message);
+        }
+    });
+}
+
+wss.on('connection', (ws) => {
+    const odeli = Date.now().toString() + Math.random().toString(36).substr(2, 9);
+    let userId = null;
+
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', (data) => {
         try {
             const msg = JSON.parse(data);
 
-            if (msg.type === 'draw') {
-                // Store stroke in history
+            // Handle user joining
+            if (msg.type === 'join') {
+                userId = odeli;
+                users[userId] = {
+                    username: msg.username || 'Anonymous',
+                    color: msg.color || '#000000'
+                };
+
+                console.log(`User joined: ${users[userId].username} (${userId}). Total: ${Object.keys(users).length}`);
+
+                // Send init data to new user
+                ws.send(JSON.stringify({
+                    type: 'init',
+                    id: userId,
+                    users: users
+                }));
+
+                // Send drawing history
+                if (drawHistory.length > 0) {
+                    ws.send(JSON.stringify({
+                        type: 'history',
+                        strokes: drawHistory
+                    }));
+                }
+
+                // Broadcast new user to others
+                broadcast({
+                    type: 'userJoined',
+                    id: userId,
+                    username: users[userId].username,
+                    color: users[userId].color
+                }, ws);
+            }
+
+            // Handle drawing
+            if (msg.type === 'draw' && userId) {
                 drawHistory.push(msg.stroke);
 
-                // Trim history if too large
                 if (drawHistory.length > MAX_HISTORY) {
                     drawHistory = drawHistory.slice(-MAX_HISTORY);
                 }
 
-                // Broadcast to all OTHER clients
-                wss.clients.forEach(client => {
-                    if (client !== ws && client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify({
-                            type: 'draw',
-                            stroke: msg.stroke
-                        }));
-                    }
-                });
+                broadcast({
+                    type: 'draw',
+                    stroke: msg.stroke
+                }, ws);
             }
 
+            // Handle color change
+            if (msg.type === 'colorChange' && userId && users[userId]) {
+                users[userId].color = msg.color;
+                broadcast({
+                    type: 'userColorChanged',
+                    id: userId,
+                    color: msg.color
+                }, ws);
+            }
+
+            // Handle clear
             if (msg.type === 'clear') {
                 drawHistory = [];
-                // Broadcast clear to everyone
-                wss.clients.forEach(client => {
-                    if (client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify({ type: 'clear' }));
-                    }
-                });
+                broadcastToAll({ type: 'clear' });
             }
+
         } catch (e) {
             console.error('Error parsing message:', e);
         }
     });
 
     ws.on('close', () => {
-        console.log('Client disconnected. Total:', wss.clients.size);
+        if (userId && users[userId]) {
+            console.log(`User left: ${users[userId].username} (${userId}). Total: ${Object.keys(users).length - 1}`);
+            delete users[userId];
+            broadcast({
+                type: 'userLeft',
+                id: userId
+            });
+        }
     });
 });
 
-// Keep connections alive with ping/pong
+// Keep connections alive
 setInterval(() => {
     wss.clients.forEach(ws => {
         if (ws.isAlive === false) return ws.terminate();
@@ -72,7 +131,4 @@ setInterval(() => {
     });
 }, 30000);
 
-wss.on('connection', (ws) => {
-    ws.isAlive = true;
-    ws.on('pong', () => { ws.isAlive = true; });
-});
+console.log('Server ready!');
