@@ -8,23 +8,22 @@ const wss = new WebSocket.Server({ port: PORT });
 // ============================================
 const NUM_ROOMS = 5;
 const PLAYERS_PER_TEAM = 2;
-const ROUND_DURATION = 120; // seconds
-const FORTRESS_TIME = 15; // seconds head start for defenders
-const COUNTDOWN_TIME = 5; // seconds before game starts
+const ROUND_DURATION = 120;
+const FORTRESS_TIME = 15;
+const COUNTDOWN_TIME = 5;
 const POINTS_TO_WIN = 3;
 const MAX_INK = 100;
-const INK_REGEN_RATE = 8; // per second (increased for better gameplay)
+const INK_REGEN_RATE = 8;
 const INK_COST_PER_PIXEL = 0.12;
 const CRYSTAL_RADIUS = 40;
 const CRYSTAL_X = 80;
-const CRYSTAL_Y = 350; // center of 700px height
-const COLLISION_RADIUS = 15;
+const CRYSTAL_Y = 350;
+const COLLISION_THRESHOLD = 20; // Distance threshold for collision
 
 // ============================================
 // ROOM & GAME STATE
 // ============================================
 
-// Initialize 5 rooms
 const rooms = {};
 for (let i = 1; i <= NUM_ROOMS; i++) {
     rooms[i] = {
@@ -33,23 +32,127 @@ for (let i = 1; i <= NUM_ROOMS; i++) {
         redTeam: [],
         blueTeam: [],
         strokes: [],
-        gameState: 'waiting', // waiting, countdown, fortress, playing, roundEnd, gameOver
+        gameState: 'waiting',
         scores: { red: 0, blue: 0 },
         currentRound: 0,
-        attackingTeam: 'red', // red attacks first, then swap
+        attackingTeam: 'red',
         timer: null,
         timeRemaining: ROUND_DURATION,
         fortressTimer: null,
         countdownTimer: null,
-        inkRegenTimer: null
+        inkRegenTimer: null,
+        strokeIdCounter: 0
     };
 }
 
-// Player connections mapped to their data
 const playerData = new Map();
 
 console.log(`⚔️  Siege Server running on port ${PORT}`);
 console.log(`📍 ${NUM_ROOMS} rooms available`);
+
+// ============================================
+// COLLISION DETECTION - PROPER LINE SEGMENT
+// ============================================
+
+// Calculate minimum distance between two line segments
+function lineSegmentDistance(x1, y1, x2, y2, x3, y3, x4, y4) {
+    // Check if segments intersect
+    if (segmentsIntersect(x1, y1, x2, y2, x3, y3, x4, y4)) {
+        return 0;
+    }
+
+    // Otherwise find minimum distance between endpoints and segments
+    const d1 = pointToSegmentDistance(x1, y1, x3, y3, x4, y4);
+    const d2 = pointToSegmentDistance(x2, y2, x3, y3, x4, y4);
+    const d3 = pointToSegmentDistance(x3, y3, x1, y1, x2, y2);
+    const d4 = pointToSegmentDistance(x4, y4, x1, y1, x2, y2);
+
+    return Math.min(d1, d2, d3, d4);
+}
+
+// Check if two line segments intersect
+function segmentsIntersect(x1, y1, x2, y2, x3, y3, x4, y4) {
+    const d1 = direction(x3, y3, x4, y4, x1, y1);
+    const d2 = direction(x3, y3, x4, y4, x2, y2);
+    const d3 = direction(x1, y1, x2, y2, x3, y3);
+    const d4 = direction(x1, y1, x2, y2, x4, y4);
+
+    if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+        ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) {
+        return true;
+    }
+
+    if (d1 === 0 && onSegment(x3, y3, x4, y4, x1, y1)) return true;
+    if (d2 === 0 && onSegment(x3, y3, x4, y4, x2, y2)) return true;
+    if (d3 === 0 && onSegment(x1, y1, x2, y2, x3, y3)) return true;
+    if (d4 === 0 && onSegment(x1, y1, x2, y2, x4, y4)) return true;
+
+    return false;
+}
+
+function direction(xi, yi, xj, yj, xk, yk) {
+    return (xk - xi) * (yj - yi) - (xj - xi) * (yk - yi);
+}
+
+function onSegment(xi, yi, xj, yj, xk, yk) {
+    return Math.min(xi, xj) <= xk && xk <= Math.max(xi, xj) &&
+        Math.min(yi, yj) <= yk && yk <= Math.max(yi, yj);
+}
+
+// Distance from point to line segment
+function pointToSegmentDistance(px, py, x1, y1, x2, y2) {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const lengthSq = dx * dx + dy * dy;
+
+    if (lengthSq === 0) {
+        return Math.sqrt((px - x1) * (px - x1) + (py - y1) * (py - y1));
+    }
+
+    let t = ((px - x1) * dx + (py - y1) * dy) / lengthSq;
+    t = Math.max(0, Math.min(1, t));
+
+    const nearestX = x1 + t * dx;
+    const nearestY = y1 + t * dy;
+
+    return Math.sqrt((px - nearestX) * (px - nearestX) + (py - nearestY) * (py - nearestY));
+}
+
+// Check collision between new stroke and all enemy strokes
+function checkStrokeCollisions(roomId, newStroke, newStrokeTeam) {
+    const room = rooms[roomId];
+    const collidedIds = [];
+
+    const threshold = COLLISION_THRESHOLD + (newStroke.size / 2);
+
+    room.strokes.forEach((existingStroke) => {
+        // Only check collision between different teams
+        if (existingStroke.team === newStrokeTeam) return;
+
+        const combinedThreshold = threshold + (existingStroke.size / 2);
+
+        const dist = lineSegmentDistance(
+            newStroke.x1, newStroke.y1, newStroke.x2, newStroke.y2,
+            existingStroke.x1, existingStroke.y1, existingStroke.x2, existingStroke.y2
+        );
+
+        if (dist < combinedThreshold) {
+            collidedIds.push(existingStroke.id);
+        }
+    });
+
+    return collidedIds;
+}
+
+function checkCrystalCollision(stroke) {
+    const dx = stroke.x2 - stroke.x1;
+    const dy = stroke.y2 - stroke.y1;
+
+    // Check distance from crystal center to line segment
+    const dist = pointToSegmentDistance(CRYSTAL_X, CRYSTAL_Y, stroke.x1, stroke.y1, stroke.x2, stroke.y2);
+
+    return dist < (CRYSTAL_RADIUS + stroke.size / 2);
+}
 
 // ============================================
 // HELPER FUNCTIONS
@@ -69,7 +172,16 @@ function broadcast(roomId, data, exclude = null) {
 }
 
 function broadcastToAll(roomId, data) {
-    broadcast(roomId, data, null);
+    const message = JSON.stringify(data);
+    const room = rooms[roomId];
+
+    if (!room) return;
+
+    Object.values(room.players).forEach(player => {
+        if (player.ws.readyState === WebSocket.OPEN) {
+            player.ws.send(message);
+        }
+    });
 }
 
 function getPublicPlayerList(roomId) {
@@ -110,7 +222,6 @@ function getRoomSummaries() {
 function assignTeam(roomId) {
     const room = rooms[roomId];
 
-    // Assign to team with fewer players, prefer red if equal
     if (room.redTeam.length <= room.blueTeam.length) {
         return 'red';
     } else {
@@ -127,7 +238,6 @@ function canJoinRoom(roomId) {
 function checkGameStart(roomId) {
     const room = rooms[roomId];
 
-    // Need exactly 2v2 to start
     if (room.redTeam.length >= PLAYERS_PER_TEAM &&
         room.blueTeam.length >= PLAYERS_PER_TEAM &&
         room.gameState === 'waiting') {
@@ -158,12 +268,10 @@ function clearAllTimers(roomId) {
 function startInkRegeneration(roomId) {
     const room = rooms[roomId];
 
-    // Clear existing ink regen timer
     if (room.inkRegenTimer) {
         clearInterval(room.inkRegenTimer);
     }
 
-    // Regenerate ink every second for all players
     room.inkRegenTimer = setInterval(() => {
         let inkChanged = false;
 
@@ -174,7 +282,6 @@ function startInkRegeneration(roomId) {
             }
         });
 
-        // Broadcast ink updates if any changed
         if (inkChanged) {
             broadcastToAll(roomId, {
                 type: 'inkUpdate',
@@ -197,7 +304,6 @@ function startCountdown(roomId) {
         timeRemaining: COUNTDOWN_TIME
     });
 
-    // Countdown timer
     room.countdownTimer = setInterval(() => {
         room.timeRemaining--;
 
@@ -220,7 +326,6 @@ function startFortressPhase(roomId) {
     room.currentRound++;
     room.timeRemaining = FORTRESS_TIME;
 
-    // Reset ink for all players at round start
     Object.values(room.players).forEach(player => {
         player.ink = MAX_INK;
     });
@@ -236,10 +341,8 @@ function startFortressPhase(roomId) {
         players: getPublicPlayerList(roomId)
     });
 
-    // Start ink regeneration
     startInkRegeneration(roomId);
 
-    // Fortress countdown
     room.fortressTimer = setInterval(() => {
         room.timeRemaining--;
 
@@ -272,7 +375,6 @@ function startPlayingPhase(roomId) {
         players: getPublicPlayerList(roomId)
     });
 
-    // Game countdown (ink regen is already running)
     room.timer = setInterval(() => {
         room.timeRemaining--;
 
@@ -283,7 +385,6 @@ function startPlayingPhase(roomId) {
         });
 
         if (room.timeRemaining <= 0) {
-            // Defenders win!
             endRound(roomId, room.attackingTeam === 'red' ? 'blue' : 'red');
         }
     }, 1000);
@@ -297,7 +398,7 @@ function endRound(roomId, winner) {
     room.gameState = 'roundEnd';
     room.scores[winner]++;
 
-    console.log(`🏆 Room ${roomId}: ${winner.toUpperCase()} wins the round! Score: Red ${room.scores.red} - Blue ${room.scores.blue}`);
+    console.log(`🏆 Room ${roomId}: ${winner.toUpperCase()} wins! Score: Red ${room.scores.red} - Blue ${room.scores.blue}`);
 
     broadcastToAll(roomId, {
         type: 'roundEnd',
@@ -305,30 +406,23 @@ function endRound(roomId, winner) {
         scores: room.scores
     });
 
-    // Check for game over
     if (room.scores.red >= POINTS_TO_WIN || room.scores.blue >= POINTS_TO_WIN) {
         gameOver(roomId, room.scores.red >= POINTS_TO_WIN ? 'red' : 'blue');
         return;
     }
 
-    // Swap attacking team for next round
     room.attackingTeam = room.attackingTeam === 'red' ? 'blue' : 'red';
-
-    // Clear strokes for new round
     room.strokes = [];
+    room.strokeIdCounter = 0;
 
-    // Reset ink for all players
     Object.values(room.players).forEach(player => {
         player.ink = MAX_INK;
     });
 
-    // Start next round after delay
     setTimeout(() => {
-        // Check we still have enough players
         if (room.redTeam.length >= PLAYERS_PER_TEAM && room.blueTeam.length >= PLAYERS_PER_TEAM) {
             startFortressPhase(roomId);
         } else {
-            // Not enough players, reset room
             resetRoom(roomId);
         }
     }, 3000);
@@ -348,7 +442,6 @@ function gameOver(roomId, winner) {
         scores: room.scores
     });
 
-    // Reset room after delay
     setTimeout(() => {
         resetRoom(roomId);
     }, 5000);
@@ -360,13 +453,13 @@ function resetRoom(roomId) {
     clearAllTimers(roomId);
 
     room.strokes = [];
+    room.strokeIdCounter = 0;
     room.gameState = 'waiting';
     room.scores = { red: 0, blue: 0 };
     room.currentRound = 0;
     room.attackingTeam = 'red';
     room.timeRemaining = ROUND_DURATION;
 
-    // Reset player ink
     Object.values(room.players).forEach(player => {
         player.ink = MAX_INK;
     });
@@ -376,71 +469,7 @@ function resetRoom(roomId) {
         players: getPublicPlayerList(roomId)
     });
 
-    // Check if we can start a new game
     checkGameStart(roomId);
-}
-
-function checkCrystalCollision(stroke, attackingTeam) {
-    // Check if the stroke touches the crystal
-    const dx = stroke.x2 - stroke.x1;
-    const dy = stroke.y2 - stroke.y1;
-    const len = Math.sqrt(dx * dx + dy * dy);
-
-    if (len === 0) {
-        const dist = Math.sqrt(Math.pow(stroke.x1 - CRYSTAL_X, 2) + Math.pow(stroke.y1 - CRYSTAL_Y, 2));
-        return dist < CRYSTAL_RADIUS + stroke.size / 2;
-    }
-
-    // Check multiple points along the stroke
-    for (let t = 0; t <= 1; t += 0.1) {
-        const px = stroke.x1 + dx * t;
-        const py = stroke.y1 + dy * t;
-        const dist = Math.sqrt(Math.pow(px - CRYSTAL_X, 2) + Math.pow(py - CRYSTAL_Y, 2));
-
-        if (dist < CRYSTAL_RADIUS + stroke.size / 2) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-function checkStrokeCollisions(roomId, newStroke, newStrokeTeam) {
-    const room = rooms[roomId];
-    const collidedIndices = [];
-
-    room.strokes.forEach((existingStroke, index) => {
-        // Only check collision between different teams
-        if (existingStroke.team === newStrokeTeam) return;
-
-        // Simple proximity check for collision
-        const minDist = COLLISION_RADIUS + (existingStroke.size + newStroke.size) / 2;
-
-        // Check endpoints and midpoints
-        const points1 = [
-            { x: newStroke.x1, y: newStroke.y1 },
-            { x: newStroke.x2, y: newStroke.y2 },
-            { x: (newStroke.x1 + newStroke.x2) / 2, y: (newStroke.y1 + newStroke.y2) / 2 }
-        ];
-
-        const points2 = [
-            { x: existingStroke.x1, y: existingStroke.y1 },
-            { x: existingStroke.x2, y: existingStroke.y2 },
-            { x: (existingStroke.x1 + existingStroke.x2) / 2, y: (existingStroke.y1 + existingStroke.y2) / 2 }
-        ];
-
-        for (const p1 of points1) {
-            for (const p2 of points2) {
-                const dist = Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
-                if (dist < minDist) {
-                    collidedIndices.push(index);
-                    return;
-                }
-            }
-        }
-    });
-
-    return collidedIndices;
 }
 
 // ============================================
@@ -450,7 +479,6 @@ function checkStrokeCollisions(roomId, newStroke, newStrokeTeam) {
 wss.on('connection', (ws) => {
     const odeli = Date.now().toString() + Math.random().toString(36).substr(2, 9);
 
-    // Send room list on connect
     ws.send(JSON.stringify({
         type: 'roomList',
         rooms: getRoomSummaries()
@@ -464,7 +492,6 @@ wss.on('connection', (ws) => {
             const msg = JSON.parse(data);
             const player = playerData.get(ws);
 
-            // Request room list
             if (msg.type === 'getRooms') {
                 ws.send(JSON.stringify({
                     type: 'roomList',
@@ -472,7 +499,6 @@ wss.on('connection', (ws) => {
                 }));
             }
 
-            // Join a room
             if (msg.type === 'joinRoom') {
                 const roomId = msg.roomId;
 
@@ -507,9 +533,8 @@ wss.on('connection', (ws) => {
 
                 playerData.set(ws, { odeli, roomId });
 
-                console.log(`👤 ${newPlayer.username} joined Room ${roomId} on ${team.toUpperCase()} team (${room.redTeam.length}v${room.blueTeam.length})`);
+                console.log(`👤 ${newPlayer.username} joined Room ${roomId} on ${team.toUpperCase()} (${room.redTeam.length}v${room.blueTeam.length})`);
 
-                // Send init to player
                 ws.send(JSON.stringify({
                     type: 'joinedRoom',
                     id: odeli,
@@ -525,7 +550,6 @@ wss.on('connection', (ws) => {
                     crystal: { x: CRYSTAL_X, y: CRYSTAL_Y, radius: CRYSTAL_RADIUS }
                 }));
 
-                // Broadcast to others
                 broadcast(roomId, {
                     type: 'playerJoined',
                     id: odeli,
@@ -534,11 +558,10 @@ wss.on('connection', (ws) => {
                     ink: MAX_INK
                 }, ws);
 
-                // Check if game can start (need 2v2)
                 checkGameStart(roomId);
             }
 
-            // Handle drawing
+            // Handle drawing - SERVER AUTHORITATIVE MODEL
             if (msg.type === 'draw' && player) {
                 const roomId = player.roomId;
                 const room = rooms[roomId];
@@ -549,19 +572,17 @@ wss.on('connection', (ws) => {
 
                 if (!playerObj) return;
 
-                // Check game state - only allow drawing in fortress (defenders only) or playing
                 const isDefender = (room.attackingTeam === 'red' && playerObj.team === 'blue') ||
                     (room.attackingTeam === 'blue' && playerObj.team === 'red');
 
                 if (room.gameState === 'fortress' && !isDefender) {
-                    return; // Attackers can't draw during fortress phase
+                    return;
                 }
 
                 if (room.gameState !== 'fortress' && room.gameState !== 'playing') {
                     return;
                 }
 
-                // Calculate ink cost
                 const dx = msg.stroke.x2 - msg.stroke.x1;
                 const dy = msg.stroke.y2 - msg.stroke.y1;
                 const strokeLength = Math.sqrt(dx * dx + dy * dy);
@@ -572,52 +593,62 @@ wss.on('connection', (ws) => {
                     return;
                 }
 
-                // Deduct ink
                 playerObj.ink -= inkCost;
 
-                // Add team info to stroke
+                // Create stroke with unique ID
                 const stroke = {
-                    ...msg.stroke,
+                    id: room.strokeIdCounter++,
+                    x1: msg.stroke.x1,
+                    y1: msg.stroke.y1,
+                    x2: msg.stroke.x2,
+                    y2: msg.stroke.y2,
+                    color: playerObj.team === 'red' ? '#ff2d55' : '#00d4ff',
+                    size: msg.stroke.size,
                     team: playerObj.team,
                     playerId: player.odeli
                 };
 
                 // Check for collisions with enemy strokes
-                const collisions = checkStrokeCollisions(roomId, stroke, playerObj.team);
+                const collidedIds = checkStrokeCollisions(roomId, stroke, playerObj.team);
 
-                if (collisions.length > 0) {
-                    // Remove collided strokes
-                    const removedStrokes = collisions.map(i => room.strokes[i]);
-                    room.strokes = room.strokes.filter((_, i) => !collisions.includes(i));
+                if (collidedIds.length > 0) {
+                    // Remove collided strokes from room
+                    room.strokes = room.strokes.filter(s => !collidedIds.includes(s.id));
 
-                    // Broadcast collision
+                    // Broadcast collision to ALL players - new stroke is also destroyed
                     broadcastToAll(roomId, {
                         type: 'collision',
-                        removedStrokes: removedStrokes,
-                        newStroke: stroke
+                        removedIds: collidedIds,
+                        newStroke: stroke, // Send it so clients can animate it
+                        destroyed: true    // But mark it as destroyed
                     });
                 } else {
-                    // Add stroke to history
+                    // No collision - add stroke and broadcast to ALL (including sender)
                     room.strokes.push(stroke);
 
-                    // Check crystal collision (only during playing phase, only attackers)
+                    // Check crystal collision (only attackers during playing phase)
                     const isAttacker = !isDefender;
                     if (room.gameState === 'playing' && isAttacker) {
-                        if (checkCrystalCollision(stroke, room.attackingTeam)) {
-                            // Attackers win!
+                        if (checkCrystalCollision(stroke)) {
+                            // Broadcast the winning stroke first
+                            broadcastToAll(roomId, {
+                                type: 'draw',
+                                stroke: stroke
+                            });
+                            // Then end the round
                             endRound(roomId, room.attackingTeam);
                             return;
                         }
                     }
 
-                    // Broadcast stroke
-                    broadcast(roomId, {
+                    // Broadcast stroke to ALL clients (server authoritative)
+                    broadcastToAll(roomId, {
                         type: 'draw',
                         stroke: stroke
-                    }, ws);
+                    });
                 }
 
-                // Send ink update to player
+                // Send ink update to the drawing player
                 ws.send(JSON.stringify({
                     type: 'inkUpdate',
                     ink: playerObj.ink
@@ -640,27 +671,22 @@ wss.on('connection', (ws) => {
                 const team = room.players[odeli].team;
                 const username = room.players[odeli].username;
 
-                // Remove from team
                 if (team === 'red') {
                     room.redTeam = room.redTeam.filter(id => id !== odeli);
                 } else {
                     room.blueTeam = room.blueTeam.filter(id => id !== odeli);
                 }
 
-                // Remove from players
                 delete room.players[odeli];
 
                 console.log(`👋 ${username} left Room ${roomId} (${room.redTeam.length}v${room.blueTeam.length})`);
 
-                // Broadcast departure
                 broadcast(roomId, {
                     type: 'playerLeft',
                     id: odeli
                 });
 
-                // Handle player leaving during countdown
                 if (room.gameState === 'countdown') {
-                    // Cancel countdown if not enough players
                     if (room.redTeam.length < PLAYERS_PER_TEAM || room.blueTeam.length < PLAYERS_PER_TEAM) {
                         clearAllTimers(roomId);
                         room.gameState = 'waiting';
@@ -671,10 +697,8 @@ wss.on('connection', (ws) => {
                     }
                 }
 
-                // Check if game should end during active play
                 if (room.gameState === 'playing' || room.gameState === 'fortress') {
                     if (room.redTeam.length === 0 || room.blueTeam.length === 0) {
-                        // End game if a team is empty
                         const winner = room.redTeam.length === 0 ? 'blue' : 'red';
                         endRound(roomId, winner);
                     }
@@ -686,7 +710,6 @@ wss.on('connection', (ws) => {
     });
 });
 
-// Keep connections alive
 setInterval(() => {
     wss.clients.forEach(ws => {
         if (ws.isAlive === false) return ws.terminate();
@@ -695,7 +718,6 @@ setInterval(() => {
     });
 }, 30000);
 
-// Broadcast room updates every 5 seconds
 setInterval(() => {
     const summaries = getRoomSummaries();
     wss.clients.forEach(ws => {
