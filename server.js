@@ -10,10 +10,11 @@ const NUM_ROOMS = 5;
 const PLAYERS_PER_TEAM = 2;
 const ROUND_DURATION = 120; // seconds
 const FORTRESS_TIME = 15; // seconds head start for defenders
+const COUNTDOWN_TIME = 5; // seconds before game starts
 const POINTS_TO_WIN = 3;
 const MAX_INK = 100;
-const INK_REGEN_RATE = 5; // per second
-const INK_COST_PER_PIXEL = 0.15;
+const INK_REGEN_RATE = 8; // per second (increased for better gameplay)
+const INK_COST_PER_PIXEL = 0.12;
 const CRYSTAL_RADIUS = 40;
 const CRYSTAL_X = 80;
 const CRYSTAL_Y = 350; // center of 700px height
@@ -32,13 +33,15 @@ for (let i = 1; i <= NUM_ROOMS; i++) {
         redTeam: [],
         blueTeam: [],
         strokes: [],
-        gameState: 'waiting', // waiting, fortress, playing, roundEnd, gameOver
+        gameState: 'waiting', // waiting, countdown, fortress, playing, roundEnd, gameOver
         scores: { red: 0, blue: 0 },
         currentRound: 0,
         attackingTeam: 'red', // red attacks first, then swap
         timer: null,
         timeRemaining: ROUND_DURATION,
-        fortressTimer: null
+        fortressTimer: null,
+        countdownTimer: null,
+        inkRegenTimer: null
     };
 }
 
@@ -56,6 +59,8 @@ function broadcast(roomId, data, exclude = null) {
     const message = JSON.stringify(data);
     const room = rooms[roomId];
 
+    if (!room) return;
+
     Object.values(room.players).forEach(player => {
         if (player.ws !== exclude && player.ws.readyState === WebSocket.OPEN) {
             player.ws.send(message);
@@ -69,6 +74,8 @@ function broadcastToAll(roomId, data) {
 
 function getPublicPlayerList(roomId) {
     const room = rooms[roomId];
+    if (!room) return {};
+
     const players = {};
 
     Object.entries(room.players).forEach(([id, player]) => {
@@ -120,10 +127,91 @@ function canJoinRoom(roomId) {
 function checkGameStart(roomId) {
     const room = rooms[roomId];
 
-    // Need at least 1v1 to start (can change to 2v2 for stricter)
-    if (room.redTeam.length >= 1 && room.blueTeam.length >= 1 && room.gameState === 'waiting') {
-        startFortressPhase(roomId);
+    // Need exactly 2v2 to start
+    if (room.redTeam.length >= PLAYERS_PER_TEAM &&
+        room.blueTeam.length >= PLAYERS_PER_TEAM &&
+        room.gameState === 'waiting') {
+        startCountdown(roomId);
     }
+}
+
+function clearAllTimers(roomId) {
+    const room = rooms[roomId];
+    if (room.timer) {
+        clearInterval(room.timer);
+        room.timer = null;
+    }
+    if (room.fortressTimer) {
+        clearInterval(room.fortressTimer);
+        room.fortressTimer = null;
+    }
+    if (room.countdownTimer) {
+        clearInterval(room.countdownTimer);
+        room.countdownTimer = null;
+    }
+    if (room.inkRegenTimer) {
+        clearInterval(room.inkRegenTimer);
+        room.inkRegenTimer = null;
+    }
+}
+
+function startInkRegeneration(roomId) {
+    const room = rooms[roomId];
+
+    // Clear existing ink regen timer
+    if (room.inkRegenTimer) {
+        clearInterval(room.inkRegenTimer);
+    }
+
+    // Regenerate ink every second for all players
+    room.inkRegenTimer = setInterval(() => {
+        let inkChanged = false;
+
+        Object.values(room.players).forEach(player => {
+            if (player.ink < MAX_INK) {
+                player.ink = Math.min(MAX_INK, player.ink + INK_REGEN_RATE);
+                inkChanged = true;
+            }
+        });
+
+        // Broadcast ink updates if any changed
+        if (inkChanged) {
+            broadcastToAll(roomId, {
+                type: 'inkUpdate',
+                players: getPublicPlayerList(roomId)
+            });
+        }
+    }, 1000);
+}
+
+function startCountdown(roomId) {
+    const room = rooms[roomId];
+    room.gameState = 'countdown';
+    room.timeRemaining = COUNTDOWN_TIME;
+
+    console.log(`⏱️  Room ${roomId}: Starting countdown...`);
+
+    broadcastToAll(roomId, {
+        type: 'phaseChange',
+        phase: 'countdown',
+        timeRemaining: COUNTDOWN_TIME
+    });
+
+    // Countdown timer
+    room.countdownTimer = setInterval(() => {
+        room.timeRemaining--;
+
+        broadcastToAll(roomId, {
+            type: 'countdown',
+            timeRemaining: room.timeRemaining
+        });
+
+        if (room.timeRemaining <= 0) {
+            clearInterval(room.countdownTimer);
+            room.countdownTimer = null;
+            startFortressPhase(roomId);
+        }
+    }, 1000);
 }
 
 function startFortressPhase(roomId) {
@@ -132,6 +220,11 @@ function startFortressPhase(roomId) {
     room.currentRound++;
     room.timeRemaining = FORTRESS_TIME;
 
+    // Reset ink for all players at round start
+    Object.values(room.players).forEach(player => {
+        player.ink = MAX_INK;
+    });
+
     console.log(`🏰 Room ${roomId}: Fortress phase started (Round ${room.currentRound})`);
 
     broadcastToAll(roomId, {
@@ -139,8 +232,12 @@ function startFortressPhase(roomId) {
         phase: 'fortress',
         attackingTeam: room.attackingTeam,
         timeRemaining: FORTRESS_TIME,
-        round: room.currentRound
+        round: room.currentRound,
+        players: getPublicPlayerList(roomId)
     });
+
+    // Start ink regeneration
+    startInkRegeneration(roomId);
 
     // Fortress countdown
     room.fortressTimer = setInterval(() => {
@@ -148,11 +245,13 @@ function startFortressPhase(roomId) {
 
         broadcastToAll(roomId, {
             type: 'timerUpdate',
-            timeRemaining: room.timeRemaining
+            timeRemaining: room.timeRemaining,
+            phase: 'fortress'
         });
 
         if (room.timeRemaining <= 0) {
             clearInterval(room.fortressTimer);
+            room.fortressTimer = null;
             startPlayingPhase(roomId);
         }
     }, 1000);
@@ -169,25 +268,18 @@ function startPlayingPhase(roomId) {
         type: 'phaseChange',
         phase: 'playing',
         attackingTeam: room.attackingTeam,
-        timeRemaining: ROUND_DURATION
+        timeRemaining: ROUND_DURATION,
+        players: getPublicPlayerList(roomId)
     });
 
-    // Game countdown
+    // Game countdown (ink regen is already running)
     room.timer = setInterval(() => {
         room.timeRemaining--;
 
-        // Regenerate ink for all players
-        Object.values(room.players).forEach(player => {
-            if (player.ink < MAX_INK) {
-                player.ink = Math.min(MAX_INK, player.ink + INK_REGEN_RATE);
-            }
-        });
-
-        // Send timer + ink updates
         broadcastToAll(roomId, {
             type: 'timerUpdate',
             timeRemaining: room.timeRemaining,
-            players: getPublicPlayerList(roomId)
+            phase: 'playing'
         });
 
         if (room.timeRemaining <= 0) {
@@ -200,8 +292,7 @@ function startPlayingPhase(roomId) {
 function endRound(roomId, winner) {
     const room = rooms[roomId];
 
-    clearInterval(room.timer);
-    clearInterval(room.fortressTimer);
+    clearAllTimers(roomId);
 
     room.gameState = 'roundEnd';
     room.scores[winner]++;
@@ -233,9 +324,11 @@ function endRound(roomId, winner) {
 
     // Start next round after delay
     setTimeout(() => {
-        if (Object.keys(room.players).length >= 2) {
+        // Check we still have enough players
+        if (room.redTeam.length >= PLAYERS_PER_TEAM && room.blueTeam.length >= PLAYERS_PER_TEAM) {
             startFortressPhase(roomId);
         } else {
+            // Not enough players, reset room
             resetRoom(roomId);
         }
     }, 3000);
@@ -244,6 +337,8 @@ function endRound(roomId, winner) {
 function gameOver(roomId, winner) {
     const room = rooms[roomId];
     room.gameState = 'gameOver';
+
+    clearAllTimers(roomId);
 
     console.log(`👑 Room ${roomId}: GAME OVER! ${winner.toUpperCase()} WINS!`);
 
@@ -262,8 +357,7 @@ function gameOver(roomId, winner) {
 function resetRoom(roomId) {
     const room = rooms[roomId];
 
-    clearInterval(room.timer);
-    clearInterval(room.fortressTimer);
+    clearAllTimers(roomId);
 
     room.strokes = [];
     room.gameState = 'waiting';
@@ -288,7 +382,6 @@ function resetRoom(roomId) {
 
 function checkCrystalCollision(stroke, attackingTeam) {
     // Check if the stroke touches the crystal
-    // Simple check: does the line pass near the crystal center?
     const dx = stroke.x2 - stroke.x1;
     const dy = stroke.y2 - stroke.y1;
     const len = Math.sqrt(dx * dx + dy * dy);
@@ -414,7 +507,7 @@ wss.on('connection', (ws) => {
 
                 playerData.set(ws, { odeli, roomId });
 
-                console.log(`👤 ${newPlayer.username} joined Room ${roomId} on ${team.toUpperCase()} team`);
+                console.log(`👤 ${newPlayer.username} joined Room ${roomId} on ${team.toUpperCase()} team (${room.redTeam.length}v${room.blueTeam.length})`);
 
                 // Send init to player
                 ws.send(JSON.stringify({
@@ -441,7 +534,7 @@ wss.on('connection', (ws) => {
                     ink: MAX_INK
                 }, ws);
 
-                // Check if game can start
+                // Check if game can start (need 2v2)
                 checkGameStart(roomId);
             }
 
@@ -449,6 +542,9 @@ wss.on('connection', (ws) => {
             if (msg.type === 'draw' && player) {
                 const roomId = player.roomId;
                 const room = rooms[roomId];
+
+                if (!room) return;
+
                 const playerObj = room.players[player.odeli];
 
                 if (!playerObj) return;
@@ -554,7 +650,7 @@ wss.on('connection', (ws) => {
                 // Remove from players
                 delete room.players[odeli];
 
-                console.log(`👋 ${username} left Room ${roomId}`);
+                console.log(`👋 ${username} left Room ${roomId} (${room.redTeam.length}v${room.blueTeam.length})`);
 
                 // Broadcast departure
                 broadcast(roomId, {
@@ -562,9 +658,22 @@ wss.on('connection', (ws) => {
                     id: odeli
                 });
 
-                // Check if game should end
-                if (room.redTeam.length === 0 || room.blueTeam.length === 0) {
-                    if (room.gameState === 'playing' || room.gameState === 'fortress') {
+                // Handle player leaving during countdown
+                if (room.gameState === 'countdown') {
+                    // Cancel countdown if not enough players
+                    if (room.redTeam.length < PLAYERS_PER_TEAM || room.blueTeam.length < PLAYERS_PER_TEAM) {
+                        clearAllTimers(roomId);
+                        room.gameState = 'waiting';
+                        broadcastToAll(roomId, {
+                            type: 'countdownCancelled',
+                            reason: 'Not enough players'
+                        });
+                    }
+                }
+
+                // Check if game should end during active play
+                if (room.gameState === 'playing' || room.gameState === 'fortress') {
+                    if (room.redTeam.length === 0 || room.blueTeam.length === 0) {
                         // End game if a team is empty
                         const winner = room.redTeam.length === 0 ? 'blue' : 'red';
                         endRound(roomId, winner);
