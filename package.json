@@ -1,15 +1,24 @@
 {
-    "name": "collab-draw-server",
+    "name": "ink-wars-server",
     "version": "1.0.0",
-    "description": "WebSocket server for collaborative drawing board",
+    "description": "2v2 Tactical Ink Drawing Game - WebSocket Server",
     "main": "server.js",
     "scripts": {
-        "start": "node server.js"
+        "start": "node server.js",
+        "dev": "node server.js"
     },
     "dependencies": {
         "ws": "^8.14.2"
     },
     "engines": {
         "node": ">=18.0.0"
-    }
+    },
+    "keywords": [
+        "game",
+        "websocket",
+        "multiplayer",
+        "drawing"
+    ],
+    "author": "",
+    "license": "MIT"
 }

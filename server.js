@@ -4,730 +4,458 @@ const PORT = process.env.PORT || 8080;
 const wss = new WebSocket.Server({ port: PORT });
 
 // ============================================
-// GAME CONFIGURATION
+// GAME CONSTANTS
 // ============================================
-const NUM_ROOMS = 5;
-const PLAYERS_PER_TEAM = 2;
-const ROUND_DURATION = 120;
-const FORTRESS_TIME = 15;
-const COUNTDOWN_TIME = 5;
-const POINTS_TO_WIN = 3;
-const MAX_INK = 100;
-const INK_REGEN_RATE = 8;
-const INK_COST_PER_PIXEL = 0.12;
-const CRYSTAL_RADIUS = 40;
-const CRYSTAL_X = 80;
-const CRYSTAL_Y = 350;
-const COLLISION_THRESHOLD = 20; // Distance threshold for collision
+const DEFENSE_PHASE_DURATION = 15; // seconds
+const ATTACK_PHASE_DURATION = 30; // seconds
+const TOTAL_ROUNDS = 4;
+const POINTS_TARGET_REACHED = 100;
+const POINTS_PER_DISTANCE = 0.5;
+const CANVAS_WIDTH = 1000;
+const CANVAS_HEIGHT = 650;
 
 // ============================================
-// ROOM & GAME STATE
+// STATE
 // ============================================
-
-const rooms = {};
-for (let i = 1; i <= NUM_ROOMS; i++) {
-    rooms[i] = {
-        id: i,
-        players: {},
-        redTeam: [],
-        blueTeam: [],
-        strokes: [],
-        gameState: 'waiting',
-        scores: { red: 0, blue: 0 },
-        currentRound: 0,
-        attackingTeam: 'red',
-        timer: null,
-        timeRemaining: ROUND_DURATION,
-        fortressTimer: null,
-        countdownTimer: null,
-        inkRegenTimer: null,
-        strokeIdCounter: 0
-    };
-}
-
-const playerData = new Map();
-
-console.log(`⚔️  Siege Server running on port ${PORT}`);
-console.log(`📍 ${NUM_ROOMS} rooms available`);
+let queue = []; // Players waiting for match
+let games = {}; // Active games
 
 // ============================================
-// COLLISION DETECTION - PROPER LINE SEGMENT
+// UTILITIES
 // ============================================
-
-// Calculate minimum distance between two line segments
-function lineSegmentDistance(x1, y1, x2, y2, x3, y3, x4, y4) {
-    // Check if segments intersect
-    if (segmentsIntersect(x1, y1, x2, y2, x3, y3, x4, y4)) {
-        return 0;
-    }
-
-    // Otherwise find minimum distance between endpoints and segments
-    const d1 = pointToSegmentDistance(x1, y1, x3, y3, x4, y4);
-    const d2 = pointToSegmentDistance(x2, y2, x3, y3, x4, y4);
-    const d3 = pointToSegmentDistance(x3, y3, x1, y1, x2, y2);
-    const d4 = pointToSegmentDistance(x4, y4, x1, y1, x2, y2);
-
-    return Math.min(d1, d2, d3, d4);
+function generateId() {
+    return Date.now().toString(36) + Math.random().toString(36).substr(2, 9);
 }
 
-// Check if two line segments intersect
-function segmentsIntersect(x1, y1, x2, y2, x3, y3, x4, y4) {
-    const d1 = direction(x3, y3, x4, y4, x1, y1);
-    const d2 = direction(x3, y3, x4, y4, x2, y2);
-    const d3 = direction(x1, y1, x2, y2, x3, y3);
-    const d4 = direction(x1, y1, x2, y2, x4, y4);
-
-    if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
-        ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) {
-        return true;
-    }
-
-    if (d1 === 0 && onSegment(x3, y3, x4, y4, x1, y1)) return true;
-    if (d2 === 0 && onSegment(x3, y3, x4, y4, x2, y2)) return true;
-    if (d3 === 0 && onSegment(x1, y1, x2, y2, x3, y3)) return true;
-    if (d4 === 0 && onSegment(x1, y1, x2, y2, x4, y4)) return true;
-
-    return false;
-}
-
-function direction(xi, yi, xj, yj, xk, yk) {
-    return (xk - xi) * (yj - yi) - (xj - xi) * (yk - yi);
-}
-
-function onSegment(xi, yi, xj, yj, xk, yk) {
-    return Math.min(xi, xj) <= xk && xk <= Math.max(xi, xj) &&
-        Math.min(yi, yj) <= yk && yk <= Math.max(yi, yj);
-}
-
-// Distance from point to line segment
-function pointToSegmentDistance(px, py, x1, y1, x2, y2) {
-    const dx = x2 - x1;
-    const dy = y2 - y1;
-    const lengthSq = dx * dx + dy * dy;
-
-    if (lengthSq === 0) {
-        return Math.sqrt((px - x1) * (px - x1) + (py - y1) * (py - y1));
-    }
-
-    let t = ((px - x1) * dx + (py - y1) * dy) / lengthSq;
-    t = Math.max(0, Math.min(1, t));
-
-    const nearestX = x1 + t * dx;
-    const nearestY = y1 + t * dy;
-
-    return Math.sqrt((px - nearestX) * (px - nearestX) + (py - nearestY) * (py - nearestY));
-}
-
-// Check collision between new stroke and all enemy strokes
-function checkStrokeCollisions(roomId, newStroke, newStrokeTeam) {
-    const room = rooms[roomId];
-    const collidedIds = [];
-
-    const threshold = COLLISION_THRESHOLD + (newStroke.size / 2);
-
-    room.strokes.forEach((existingStroke) => {
-        // Only check collision between different teams
-        if (existingStroke.team === newStrokeTeam) return;
-
-        const combinedThreshold = threshold + (existingStroke.size / 2);
-
-        const dist = lineSegmentDistance(
-            newStroke.x1, newStroke.y1, newStroke.x2, newStroke.y2,
-            existingStroke.x1, existingStroke.y1, existingStroke.x2, existingStroke.y2
-        );
-
-        if (dist < combinedThreshold) {
-            collidedIds.push(existingStroke.id);
-        }
-    });
-
-    return collidedIds;
-}
-
-function checkCrystalCollision(stroke) {
-    const dx = stroke.x2 - stroke.x1;
-    const dy = stroke.y2 - stroke.y1;
-
-    // Check distance from crystal center to line segment
-    const dist = pointToSegmentDistance(CRYSTAL_X, CRYSTAL_Y, stroke.x1, stroke.y1, stroke.x2, stroke.y2);
-
-    return dist < (CRYSTAL_RADIUS + stroke.size / 2);
-}
-
-// ============================================
-// HELPER FUNCTIONS
-// ============================================
-
-function broadcast(roomId, data, exclude = null) {
+function broadcast(game, data, exclude = null) {
     const message = JSON.stringify(data);
-    const room = rooms[roomId];
-
-    if (!room) return;
-
-    Object.values(room.players).forEach(player => {
+    game.players.forEach(player => {
         if (player.ws !== exclude && player.ws.readyState === WebSocket.OPEN) {
             player.ws.send(message);
         }
     });
 }
 
-function broadcastToAll(roomId, data) {
+function broadcastToTeam(game, team, data) {
     const message = JSON.stringify(data);
-    const room = rooms[roomId];
-
-    if (!room) return;
-
-    Object.values(room.players).forEach(player => {
-        if (player.ws.readyState === WebSocket.OPEN) {
+    game.players.forEach(player => {
+        if (player.team === team && player.ws.readyState === WebSocket.OPEN) {
             player.ws.send(message);
         }
     });
 }
 
-function getPublicPlayerList(roomId) {
-    const room = rooms[roomId];
-    if (!room) return {};
-
-    const players = {};
-
-    Object.entries(room.players).forEach(([id, player]) => {
-        players[id] = {
-            username: player.username,
-            team: player.team,
-            ink: player.ink
-        };
-    });
-
-    return players;
-}
-
-function getRoomSummaries() {
-    const summaries = {};
-
-    for (let i = 1; i <= NUM_ROOMS; i++) {
-        const room = rooms[i];
-        summaries[i] = {
-            id: i,
-            playerCount: Object.keys(room.players).length,
-            redCount: room.redTeam.length,
-            blueCount: room.blueTeam.length,
-            gameState: room.gameState,
-            scores: room.scores
-        };
-    }
-
-    return summaries;
-}
-
-function assignTeam(roomId) {
-    const room = rooms[roomId];
-
-    if (room.redTeam.length <= room.blueTeam.length) {
-        return 'red';
-    } else {
-        return 'blue';
-    }
-}
-
-function canJoinRoom(roomId) {
-    const room = rooms[roomId];
-    const totalPlayers = Object.keys(room.players).length;
-    return totalPlayers < PLAYERS_PER_TEAM * 2;
-}
-
-function checkGameStart(roomId) {
-    const room = rooms[roomId];
-
-    if (room.redTeam.length >= PLAYERS_PER_TEAM &&
-        room.blueTeam.length >= PLAYERS_PER_TEAM &&
-        room.gameState === 'waiting') {
-        startCountdown(roomId);
-    }
-}
-
-function clearAllTimers(roomId) {
-    const room = rooms[roomId];
-    if (room.timer) {
-        clearInterval(room.timer);
-        room.timer = null;
-    }
-    if (room.fortressTimer) {
-        clearInterval(room.fortressTimer);
-        room.fortressTimer = null;
-    }
-    if (room.countdownTimer) {
-        clearInterval(room.countdownTimer);
-        room.countdownTimer = null;
-    }
-    if (room.inkRegenTimer) {
-        clearInterval(room.inkRegenTimer);
-        room.inkRegenTimer = null;
-    }
-}
-
-function startInkRegeneration(roomId) {
-    const room = rooms[roomId];
-
-    if (room.inkRegenTimer) {
-        clearInterval(room.inkRegenTimer);
-    }
-
-    room.inkRegenTimer = setInterval(() => {
-        let inkChanged = false;
-
-        Object.values(room.players).forEach(player => {
-            if (player.ink < MAX_INK) {
-                player.ink = Math.min(MAX_INK, player.ink + INK_REGEN_RATE);
-                inkChanged = true;
-            }
-        });
-
-        if (inkChanged) {
-            broadcastToAll(roomId, {
-                type: 'inkUpdate',
-                players: getPublicPlayerList(roomId)
-            });
-        }
-    }, 1000);
-}
-
-function startCountdown(roomId) {
-    const room = rooms[roomId];
-    room.gameState = 'countdown';
-    room.timeRemaining = COUNTDOWN_TIME;
-
-    console.log(`⏱️  Room ${roomId}: Starting countdown...`);
-
-    broadcastToAll(roomId, {
-        type: 'phaseChange',
-        phase: 'countdown',
-        timeRemaining: COUNTDOWN_TIME
-    });
-
-    room.countdownTimer = setInterval(() => {
-        room.timeRemaining--;
-
-        broadcastToAll(roomId, {
-            type: 'countdown',
-            timeRemaining: room.timeRemaining
-        });
-
-        if (room.timeRemaining <= 0) {
-            clearInterval(room.countdownTimer);
-            room.countdownTimer = null;
-            startFortressPhase(roomId);
-        }
-    }, 1000);
-}
-
-function startFortressPhase(roomId) {
-    const room = rooms[roomId];
-    room.gameState = 'fortress';
-    room.currentRound++;
-    room.timeRemaining = FORTRESS_TIME;
-
-    Object.values(room.players).forEach(player => {
-        player.ink = MAX_INK;
-    });
-
-    console.log(`🏰 Room ${roomId}: Fortress phase started (Round ${room.currentRound})`);
-
-    broadcastToAll(roomId, {
-        type: 'phaseChange',
-        phase: 'fortress',
-        attackingTeam: room.attackingTeam,
-        timeRemaining: FORTRESS_TIME,
-        round: room.currentRound,
-        players: getPublicPlayerList(roomId)
-    });
-
-    startInkRegeneration(roomId);
-
-    room.fortressTimer = setInterval(() => {
-        room.timeRemaining--;
-
-        broadcastToAll(roomId, {
-            type: 'timerUpdate',
-            timeRemaining: room.timeRemaining,
-            phase: 'fortress'
-        });
-
-        if (room.timeRemaining <= 0) {
-            clearInterval(room.fortressTimer);
-            room.fortressTimer = null;
-            startPlayingPhase(roomId);
-        }
-    }, 1000);
-}
-
-function startPlayingPhase(roomId) {
-    const room = rooms[roomId];
-    room.gameState = 'playing';
-    room.timeRemaining = ROUND_DURATION;
-
-    console.log(`⚔️  Room ${roomId}: Battle phase started!`);
-
-    broadcastToAll(roomId, {
-        type: 'phaseChange',
-        phase: 'playing',
-        attackingTeam: room.attackingTeam,
-        timeRemaining: ROUND_DURATION,
-        players: getPublicPlayerList(roomId)
-    });
-
-    room.timer = setInterval(() => {
-        room.timeRemaining--;
-
-        broadcastToAll(roomId, {
-            type: 'timerUpdate',
-            timeRemaining: room.timeRemaining,
-            phase: 'playing'
-        });
-
-        if (room.timeRemaining <= 0) {
-            endRound(roomId, room.attackingTeam === 'red' ? 'blue' : 'red');
-        }
-    }, 1000);
-}
-
-function endRound(roomId, winner) {
-    const room = rooms[roomId];
-
-    clearAllTimers(roomId);
-
-    room.gameState = 'roundEnd';
-    room.scores[winner]++;
-
-    console.log(`🏆 Room ${roomId}: ${winner.toUpperCase()} wins! Score: Red ${room.scores.red} - Blue ${room.scores.blue}`);
-
-    broadcastToAll(roomId, {
-        type: 'roundEnd',
-        winner: winner,
-        scores: room.scores
-    });
-
-    if (room.scores.red >= POINTS_TO_WIN || room.scores.blue >= POINTS_TO_WIN) {
-        gameOver(roomId, room.scores.red >= POINTS_TO_WIN ? 'red' : 'blue');
-        return;
-    }
-
-    room.attackingTeam = room.attackingTeam === 'red' ? 'blue' : 'red';
-    room.strokes = [];
-    room.strokeIdCounter = 0;
-
-    Object.values(room.players).forEach(player => {
-        player.ink = MAX_INK;
-    });
-
-    setTimeout(() => {
-        if (room.redTeam.length >= PLAYERS_PER_TEAM && room.blueTeam.length >= PLAYERS_PER_TEAM) {
-            startFortressPhase(roomId);
-        } else {
-            resetRoom(roomId);
-        }
-    }, 3000);
-}
-
-function gameOver(roomId, winner) {
-    const room = rooms[roomId];
-    room.gameState = 'gameOver';
-
-    clearAllTimers(roomId);
-
-    console.log(`👑 Room ${roomId}: GAME OVER! ${winner.toUpperCase()} WINS!`);
-
-    broadcastToAll(roomId, {
-        type: 'gameOver',
-        winner: winner,
-        scores: room.scores
-    });
-
-    setTimeout(() => {
-        resetRoom(roomId);
-    }, 5000);
-}
-
-function resetRoom(roomId) {
-    const room = rooms[roomId];
-
-    clearAllTimers(roomId);
-
-    room.strokes = [];
-    room.strokeIdCounter = 0;
-    room.gameState = 'waiting';
-    room.scores = { red: 0, blue: 0 };
-    room.currentRound = 0;
-    room.attackingTeam = 'red';
-    room.timeRemaining = ROUND_DURATION;
-
-    Object.values(room.players).forEach(player => {
-        player.ink = MAX_INK;
-    });
-
-    broadcastToAll(roomId, {
-        type: 'roomReset',
-        players: getPublicPlayerList(roomId)
-    });
-
-    checkGameStart(roomId);
-}
-
 // ============================================
-// WEBSOCKET HANDLING
+// MATCHMAKING
 // ============================================
+function addToQueue(ws, username) {
+    const player = {
+        ws,
+        id: generateId(),
+        username
+    };
 
-wss.on('connection', (ws) => {
-    const odeli = Date.now().toString() + Math.random().toString(36).substr(2, 9);
+    queue.push(player);
 
-    ws.send(JSON.stringify({
-        type: 'roomList',
-        rooms: getRoomSummaries()
-    }));
-
-    ws.isAlive = true;
-    ws.on('pong', () => { ws.isAlive = true; });
-
-    ws.on('message', (data) => {
-        try {
-            const msg = JSON.parse(data);
-            const player = playerData.get(ws);
-
-            if (msg.type === 'getRooms') {
-                ws.send(JSON.stringify({
-                    type: 'roomList',
-                    rooms: getRoomSummaries()
-                }));
-            }
-
-            if (msg.type === 'joinRoom') {
-                const roomId = msg.roomId;
-
-                if (!rooms[roomId]) {
-                    ws.send(JSON.stringify({ type: 'error', message: 'Invalid room' }));
-                    return;
-                }
-
-                if (!canJoinRoom(roomId)) {
-                    ws.send(JSON.stringify({ type: 'error', message: 'Room is full' }));
-                    return;
-                }
-
-                const team = assignTeam(roomId);
-                const room = rooms[roomId];
-
-                const newPlayer = {
-                    id: odeli,
-                    username: msg.username || 'Anonymous',
-                    team: team,
-                    ink: MAX_INK,
-                    ws: ws
-                };
-
-                room.players[odeli] = newPlayer;
-
-                if (team === 'red') {
-                    room.redTeam.push(odeli);
-                } else {
-                    room.blueTeam.push(odeli);
-                }
-
-                playerData.set(ws, { odeli, roomId });
-
-                console.log(`👤 ${newPlayer.username} joined Room ${roomId} on ${team.toUpperCase()} (${room.redTeam.length}v${room.blueTeam.length})`);
-
-                ws.send(JSON.stringify({
-                    type: 'joinedRoom',
-                    id: odeli,
-                    roomId: roomId,
-                    team: team,
-                    players: getPublicPlayerList(roomId),
-                    gameState: room.gameState,
-                    scores: room.scores,
-                    attackingTeam: room.attackingTeam,
-                    timeRemaining: room.timeRemaining,
-                    round: room.currentRound,
-                    strokes: room.strokes,
-                    crystal: { x: CRYSTAL_X, y: CRYSTAL_Y, radius: CRYSTAL_RADIUS }
-                }));
-
-                broadcast(roomId, {
-                    type: 'playerJoined',
-                    id: odeli,
-                    username: newPlayer.username,
-                    team: team,
-                    ink: MAX_INK
-                }, ws);
-
-                checkGameStart(roomId);
-            }
-
-            // Handle drawing - SERVER AUTHORITATIVE MODEL
-            if (msg.type === 'draw' && player) {
-                const roomId = player.roomId;
-                const room = rooms[roomId];
-
-                if (!room) return;
-
-                const playerObj = room.players[player.odeli];
-
-                if (!playerObj) return;
-
-                const isDefender = (room.attackingTeam === 'red' && playerObj.team === 'blue') ||
-                    (room.attackingTeam === 'blue' && playerObj.team === 'red');
-
-                if (room.gameState === 'fortress' && !isDefender) {
-                    return;
-                }
-
-                if (room.gameState !== 'fortress' && room.gameState !== 'playing') {
-                    return;
-                }
-
-                const dx = msg.stroke.x2 - msg.stroke.x1;
-                const dy = msg.stroke.y2 - msg.stroke.y1;
-                const strokeLength = Math.sqrt(dx * dx + dy * dy);
-                const inkCost = strokeLength * INK_COST_PER_PIXEL * (msg.stroke.size / 10);
-
-                if (playerObj.ink < inkCost) {
-                    ws.send(JSON.stringify({ type: 'noInk' }));
-                    return;
-                }
-
-                playerObj.ink -= inkCost;
-
-                // Create stroke with unique ID
-                const stroke = {
-                    id: room.strokeIdCounter++,
-                    x1: msg.stroke.x1,
-                    y1: msg.stroke.y1,
-                    x2: msg.stroke.x2,
-                    y2: msg.stroke.y2,
-                    color: playerObj.team === 'red' ? '#ff2d55' : '#00d4ff',
-                    size: msg.stroke.size,
-                    team: playerObj.team,
-                    playerId: player.odeli
-                };
-
-                // Check for collisions with enemy strokes
-                const collidedIds = checkStrokeCollisions(roomId, stroke, playerObj.team);
-
-                if (collidedIds.length > 0) {
-                    // Remove collided strokes from room
-                    room.strokes = room.strokes.filter(s => !collidedIds.includes(s.id));
-
-                    // Broadcast collision to ALL players - new stroke is also destroyed
-                    broadcastToAll(roomId, {
-                        type: 'collision',
-                        removedIds: collidedIds,
-                        newStroke: stroke, // Send it so clients can animate it
-                        destroyed: true    // But mark it as destroyed
-                    });
-                } else {
-                    // No collision - add stroke and broadcast to ALL (including sender)
-                    room.strokes.push(stroke);
-
-                    // Check crystal collision (only attackers during playing phase)
-                    const isAttacker = !isDefender;
-                    if (room.gameState === 'playing' && isAttacker) {
-                        if (checkCrystalCollision(stroke)) {
-                            // Broadcast the winning stroke first
-                            broadcastToAll(roomId, {
-                                type: 'draw',
-                                stroke: stroke
-                            });
-                            // Then end the round
-                            endRound(roomId, room.attackingTeam);
-                            return;
-                        }
-                    }
-
-                    // Broadcast stroke to ALL clients (server authoritative)
-                    broadcastToAll(roomId, {
-                        type: 'draw',
-                        stroke: stroke
-                    });
-                }
-
-                // Send ink update to the drawing player
-                ws.send(JSON.stringify({
-                    type: 'inkUpdate',
-                    ink: playerObj.ink
-                }));
-            }
-
-        } catch (e) {
-            console.error('Error parsing message:', e);
-        }
-    });
-
-    ws.on('close', () => {
-        const player = playerData.get(ws);
-
-        if (player) {
-            const { odeli, roomId } = player;
-            const room = rooms[roomId];
-
-            if (room && room.players[odeli]) {
-                const team = room.players[odeli].team;
-                const username = room.players[odeli].username;
-
-                if (team === 'red') {
-                    room.redTeam = room.redTeam.filter(id => id !== odeli);
-                } else {
-                    room.blueTeam = room.blueTeam.filter(id => id !== odeli);
-                }
-
-                delete room.players[odeli];
-
-                console.log(`👋 ${username} left Room ${roomId} (${room.redTeam.length}v${room.blueTeam.length})`);
-
-                broadcast(roomId, {
-                    type: 'playerLeft',
-                    id: odeli
-                });
-
-                if (room.gameState === 'countdown') {
-                    if (room.redTeam.length < PLAYERS_PER_TEAM || room.blueTeam.length < PLAYERS_PER_TEAM) {
-                        clearAllTimers(roomId);
-                        room.gameState = 'waiting';
-                        broadcastToAll(roomId, {
-                            type: 'countdownCancelled',
-                            reason: 'Not enough players'
-                        });
-                    }
-                }
-
-                if (room.gameState === 'playing' || room.gameState === 'fortress') {
-                    if (room.redTeam.length === 0 || room.blueTeam.length === 0) {
-                        const winner = room.redTeam.length === 0 ? 'blue' : 'red';
-                        endRound(roomId, winner);
-                    }
-                }
-            }
-
-            playerData.delete(ws);
-        }
-    });
-});
-
-setInterval(() => {
-    wss.clients.forEach(ws => {
-        if (ws.isAlive === false) return ws.terminate();
-        ws.isAlive = false;
-        ws.ping();
-    });
-}, 30000);
-
-setInterval(() => {
-    const summaries = getRoomSummaries();
-    wss.clients.forEach(ws => {
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({
-                type: 'roomList',
-                rooms: summaries
+    // Broadcast queue update to all in queue
+    queue.forEach(p => {
+        if (p.ws.readyState === WebSocket.OPEN) {
+            p.ws.send(JSON.stringify({
+                type: 'queue_update',
+                count: queue.length
             }));
         }
     });
-}, 5000);
 
-console.log('⚔️  Siege Server ready!');
+    // Check if we have 4 players
+    if (queue.length >= 4) {
+        const gamePlayers = queue.splice(0, 4);
+        createGame(gamePlayers);
+    }
+
+    return player;
+}
+
+function removeFromQueue(ws) {
+    queue = queue.filter(p => p.ws !== ws);
+}
+
+// ============================================
+// GAME CREATION
+// ============================================
+function createGame(gamePlayers) {
+    const gameId = generateId();
+
+    // Assign teams (first 2 = red, last 2 = blue)
+    // Shuffle first for fairness
+    const shuffled = gamePlayers.sort(() => Math.random() - 0.5);
+
+    const players = shuffled.map((player, index) => ({
+        ...player,
+        team: index < 2 ? 'red' : 'blue',
+        spawnIndex: index % 2
+    }));
+
+    const game = {
+        id: gameId,
+        players,
+        state: {
+            phase: 'waiting',
+            round: 1,
+            attackingTeam: 'red', // Red attacks first
+            defendingTeam: 'blue',
+            timeRemaining: 0,
+            scores: { red: 0, blue: 0 }
+        },
+        lines: {
+            permanent: [],
+            fading: []
+        },
+        attackerPaths: {},
+        roundTargetReached: false,
+        timerInterval: null
+    };
+
+    games[gameId] = game;
+
+    // Link players to game
+    players.forEach(player => {
+        player.ws.gameId = gameId;
+        player.ws.playerId = player.id;
+    });
+
+    // Build players object for client
+    const playersObj = {};
+    players.forEach(p => {
+        playersObj[p.id] = {
+            id: p.id,
+            username: p.username,
+            team: p.team
+        };
+    });
+
+    // Send game start to all players
+    players.forEach(player => {
+        player.ws.send(JSON.stringify({
+            type: 'game_start',
+            gameId,
+            yourId: player.id,
+            yourTeam: player.team,
+            spawnIndex: player.spawnIndex,
+            players: playersObj
+        }));
+    });
+
+    // Start first round after brief delay
+    setTimeout(() => startRound(game), 1000);
+
+    console.log(`Game ${gameId} created with players:`, players.map(p => `${p.username} (${p.team})`));
+}
+
+// ============================================
+// GAME FLOW
+// ============================================
+function startRound(game) {
+    game.state.phase = 'defense';
+    game.state.timeRemaining = DEFENSE_PHASE_DURATION;
+    game.roundTargetReached = false;
+    game.attackerPaths = {};
+
+    // Clear lines from previous round (but keep permanent lines?)
+    // For now, clear all for new round
+    game.lines = { permanent: [], fading: [] };
+
+    // Notify phase change
+    broadcast(game, {
+        type: 'phase_change',
+        phase: 'defense',
+        round: game.state.round,
+        attackingTeam: game.state.attackingTeam,
+        defendingTeam: game.state.defendingTeam,
+        duration: DEFENSE_PHASE_DURATION
+    });
+
+    // Start timer
+    startTimer(game, DEFENSE_PHASE_DURATION, () => {
+        startAttackPhase(game);
+    });
+}
+
+function startAttackPhase(game) {
+    game.state.phase = 'attack';
+    game.state.timeRemaining = ATTACK_PHASE_DURATION;
+
+    broadcast(game, {
+        type: 'phase_change',
+        phase: 'attack',
+        round: game.state.round,
+        attackingTeam: game.state.attackingTeam,
+        defendingTeam: game.state.defendingTeam,
+        duration: ATTACK_PHASE_DURATION
+    });
+
+    startTimer(game, ATTACK_PHASE_DURATION, () => {
+        endRound(game);
+    });
+}
+
+function startTimer(game, duration, callback) {
+    if (game.timerInterval) {
+        clearInterval(game.timerInterval);
+    }
+
+    game.state.timeRemaining = duration;
+
+    game.timerInterval = setInterval(() => {
+        game.state.timeRemaining--;
+
+        // Sync timer every 5 seconds
+        if (game.state.timeRemaining % 5 === 0 || game.state.timeRemaining <= 5) {
+            broadcast(game, {
+                type: 'timer_sync',
+                time: game.state.timeRemaining
+            });
+        }
+
+        if (game.state.timeRemaining <= 0) {
+            clearInterval(game.timerInterval);
+            callback();
+        }
+    }, 1000);
+}
+
+function endRound(game) {
+    clearInterval(game.timerInterval);
+
+    // Calculate round score
+    const attackingTeam = game.state.attackingTeam;
+
+    if (game.roundTargetReached) {
+        game.state.scores[attackingTeam] += POINTS_TARGET_REACHED;
+    } else {
+        // Score based on max distance reached
+        let maxDistance = 0;
+        for (const path of Object.values(game.attackerPaths)) {
+            if (path.maxDistance > maxDistance) {
+                maxDistance = path.maxDistance;
+            }
+        }
+        game.state.scores[attackingTeam] += Math.floor(maxDistance * POINTS_PER_DISTANCE);
+    }
+
+    broadcast(game, {
+        type: 'score_update',
+        scores: game.state.scores
+    });
+
+    // Check if game is over
+    if (game.state.round >= TOTAL_ROUNDS) {
+        endGame(game);
+        return;
+    }
+
+    // Swap teams and start next round
+    game.state.round++;
+    const temp = game.state.attackingTeam;
+    game.state.attackingTeam = game.state.defendingTeam;
+    game.state.defendingTeam = temp;
+
+    setTimeout(() => startRound(game), 2000);
+}
+
+function endGame(game) {
+    game.state.phase = 'gameover';
+
+    broadcast(game, {
+        type: 'game_over',
+        scores: game.state.scores,
+        winner: game.state.scores.red > game.state.scores.blue ? 'red' :
+            game.state.scores.blue > game.state.scores.red ? 'blue' : 'draw'
+    });
+
+    // Clean up game after delay
+    setTimeout(() => {
+        delete games[game.id];
+        console.log(`Game ${game.id} ended and cleaned up`);
+    }, 60000);
+}
+
+function handleTargetReached(game, playerId) {
+    if (!game.roundTargetReached) {
+        game.roundTargetReached = true;
+
+        // End attack phase early
+        clearInterval(game.timerInterval);
+
+        broadcast(game, {
+            type: 'target_reached',
+            playerId
+        });
+
+        // Brief celebration delay, then end round
+        setTimeout(() => endRound(game), 2000);
+    }
+}
+
+// ============================================
+// MESSAGE HANDLING
+// ============================================
+function handleMessage(ws, data) {
+    try {
+        const msg = JSON.parse(data);
+
+        switch (msg.type) {
+            case 'join_queue':
+                addToQueue(ws, msg.username || 'Anonymous');
+                break;
+
+            case 'draw':
+                handleDraw(ws, msg);
+                break;
+
+            case 'line_complete':
+                handleLineComplete(ws, msg);
+                break;
+
+            case 'stunned':
+                handleStunned(ws, msg);
+                break;
+
+            case 'target_reached':
+                handleTargetReachedMsg(ws, msg);
+                break;
+        }
+    } catch (e) {
+        console.error('Error handling message:', e);
+    }
+}
+
+function handleDraw(ws, msg) {
+    const game = games[ws.gameId];
+    if (!game) return;
+
+    const player = game.players.find(p => p.ws === ws);
+    if (!player) return;
+
+    // Broadcast to other players
+    broadcast(game, {
+        type: 'draw_line',
+        playerId: player.id,
+        team: player.team,
+        point: msg.point,
+        inkType: msg.inkType
+    }, ws);
+
+    // Track attacker path for scoring
+    if (player.team === game.state.attackingTeam && game.state.phase === 'attack') {
+        if (!game.attackerPaths[player.id]) {
+            game.attackerPaths[player.id] = { points: [], maxDistance: 0 };
+        }
+        game.attackerPaths[player.id].points.push(msg.point);
+
+        // Calculate distance from target
+        const targetX = CANVAS_WIDTH / 2;
+        const targetY = CANVAS_HEIGHT / 2;
+        const dist = Math.sqrt(
+            Math.pow(msg.point.x - targetX, 2) +
+            Math.pow(msg.point.y - targetY, 2)
+        );
+        const progress = CANVAS_WIDTH / 2 - dist;
+        game.attackerPaths[player.id].maxDistance = Math.max(
+            game.attackerPaths[player.id].maxDistance,
+            progress
+        );
+    }
+}
+
+function handleLineComplete(ws, msg) {
+    const game = games[ws.gameId];
+    if (!game) return;
+
+    const player = game.players.find(p => p.ws === ws);
+    if (!player) return;
+
+    // Store defender lines
+    if (player.team === game.state.defendingTeam && game.state.phase === 'defense') {
+        if (msg.inkType === 'fading') {
+            game.lines.fading.push({
+                ...msg.line,
+                createdAt: Date.now()
+            });
+        } else {
+            game.lines.permanent.push(msg.line);
+        }
+    }
+}
+
+function handleStunned(ws, msg) {
+    const game = games[ws.gameId];
+    if (!game) return;
+
+    broadcast(game, {
+        type: 'player_stunned',
+        playerId: msg.playerId
+    }, ws);
+}
+
+function handleTargetReachedMsg(ws, msg) {
+    const game = games[ws.gameId];
+    if (!game) return;
+
+    handleTargetReached(game, msg.playerId);
+}
+
+// ============================================
+// CONNECTION HANDLING
+// ============================================
+wss.on('connection', (ws) => {
+    console.log('New connection');
+
+    ws.on('message', (data) => {
+        handleMessage(ws, data);
+    });
+
+    ws.on('close', () => {
+        // Remove from queue if waiting
+        removeFromQueue(ws);
+
+        // Handle disconnection from active game
+        if (ws.gameId && games[ws.gameId]) {
+            const game = games[ws.gameId];
+            const player = game.players.find(p => p.ws === ws);
+
+            if (player) {
+                console.log(`Player ${player.username} disconnected from game ${game.id}`);
+
+                // Notify other players
+                broadcast(game, {
+                    type: 'player_disconnected',
+                    playerId: player.id
+                }, ws);
+
+                // For now, just continue the game
+                // In production, you might want to pause or end the game
+            }
+        }
+    });
+
+    ws.on('error', (error) => {
+        console.error('WebSocket error:', error);
+    });
+});
+
+// ============================================
+// CLEANUP
+// ============================================
+// Clean up fading lines periodically
+setInterval(() => {
+    const now = Date.now();
+    for (const game of Object.values(games)) {
+        game.lines.fading = game.lines.fading.filter(
+            line => (now - line.createdAt) < 8000
+        );
+    }
+}, 1000);
+
+console.log(`Ink Wars server running on port ${PORT}`);
+console.log('Waiting for players...');
