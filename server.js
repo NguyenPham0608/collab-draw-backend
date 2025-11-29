@@ -14,6 +14,19 @@ const POINTS_PER_DISTANCE = 0.5;
 const CANVAS_WIDTH = 1000;
 const CANVAS_HEIGHT = 650;
 
+// Coin & Powerup Constants
+const COIN_SPAWN_COUNT = 6;
+const COIN_RADIUS = 18;
+const PROTECTED_ZONE_RADIUS = 120;
+const SPAWN_ZONE_RADIUS = 60;
+
+const POWERUPS = {
+    quickRecovery: { cost: 3, name: 'Quick Recovery', desc: 'Stun time reduced to 1s' },
+    extraInk: { cost: 4, name: 'Extra Ink', desc: '+50% ink capacity' },
+    biggerBlast: { cost: 5, name: 'Bigger Blast', desc: '+50% explosion radius' },
+    speedDraw: { cost: 3, name: 'Speed Draw', desc: 'Ink drains 30% slower' }
+};
+
 // ============================================
 // STATE
 // ============================================
@@ -113,7 +126,11 @@ function createGame(gamePlayers) {
         },
         attackerPaths: {},
         roundTargetReached: false,
-        timerInterval: null
+        timerInterval: null,
+        // Coin system
+        coins: [],
+        teamCoins: { red: 0, blue: 0 },
+        activePowerups: { red: [], blue: [] }
     };
 
     games[gameId] = game;
@@ -142,7 +159,8 @@ function createGame(gamePlayers) {
             yourId: player.id,
             yourTeam: player.team,
             spawnIndex: player.spawnIndex,
-            players: playersObj
+            players: playersObj,
+            powerupDefs: POWERUPS
         }));
     });
 
@@ -161,9 +179,16 @@ function startRound(game) {
     game.roundTargetReached = false;
     game.attackerPaths = {};
 
-    // Clear lines from previous round (but keep permanent lines?)
-    // For now, clear all for new round
+    // Clear lines from previous round
     game.lines = { permanent: [], fading: [] };
+
+    // Clear coins
+    game.coins = [];
+
+    // Clear powerups for the team that's NOW attacking (they need to collect fresh)
+    const attackingTeam = game.state.attackingTeam;
+    game.activePowerups[attackingTeam] = [];
+    game.teamCoins[attackingTeam] = 0;
 
     // Notify phase change
     broadcast(game, {
@@ -172,7 +197,9 @@ function startRound(game) {
         round: game.state.round,
         attackingTeam: game.state.attackingTeam,
         defendingTeam: game.state.defendingTeam,
-        duration: DEFENSE_PHASE_DURATION
+        duration: DEFENSE_PHASE_DURATION,
+        teamCoins: game.teamCoins,
+        activePowerups: game.activePowerups[attackingTeam]
     });
 
     // Start timer
@@ -185,18 +212,83 @@ function startAttackPhase(game) {
     game.state.phase = 'attack';
     game.state.timeRemaining = ATTACK_PHASE_DURATION;
 
+    // Spawn coins for this attack phase
+    game.coins = spawnCoins();
+
+    // Clear team coins for fresh collection (powerups were already applied)
+    const attackingTeam = game.state.attackingTeam;
+    game.teamCoins[attackingTeam] = 0;
+
     broadcast(game, {
         type: 'phase_change',
         phase: 'attack',
         round: game.state.round,
         attackingTeam: game.state.attackingTeam,
         defendingTeam: game.state.defendingTeam,
-        duration: ATTACK_PHASE_DURATION
+        duration: ATTACK_PHASE_DURATION,
+        coins: game.coins,
+        activePowerups: game.activePowerups[attackingTeam]
     });
 
     startTimer(game, ATTACK_PHASE_DURATION, () => {
         endRound(game);
     });
+}
+
+function spawnCoins() {
+    const coins = [];
+    const centerX = CANVAS_WIDTH / 2;
+    const centerY = CANVAS_HEIGHT / 2;
+
+    for (let i = 0; i < COIN_SPAWN_COUNT; i++) {
+        let x, y, valid;
+        let attempts = 0;
+
+        do {
+            valid = true;
+            // Spawn in middle area, avoiding edges and protected zone
+            x = 150 + Math.random() * (CANVAS_WIDTH - 300);
+            y = 80 + Math.random() * (CANVAS_HEIGHT - 160);
+
+            // Check not in protected zone
+            const distToCenter = Math.sqrt(Math.pow(x - centerX, 2) + Math.pow(y - centerY, 2));
+            if (distToCenter < PROTECTED_ZONE_RADIUS + 30) {
+                valid = false;
+            }
+
+            // Check not in spawn zones
+            const spawnPoints = [
+                { x: 80, y: CANVAS_HEIGHT / 2 - 100 },
+                { x: 80, y: CANVAS_HEIGHT / 2 + 100 },
+                { x: CANVAS_WIDTH - 80, y: CANVAS_HEIGHT / 2 - 100 },
+                { x: CANVAS_WIDTH - 80, y: CANVAS_HEIGHT / 2 + 100 }
+            ];
+            for (const spawn of spawnPoints) {
+                const distToSpawn = Math.sqrt(Math.pow(x - spawn.x, 2) + Math.pow(y - spawn.y, 2));
+                if (distToSpawn < SPAWN_ZONE_RADIUS + 30) {
+                    valid = false;
+                    break;
+                }
+            }
+
+            // Check not too close to other coins
+            for (const coin of coins) {
+                const distToCoin = Math.sqrt(Math.pow(x - coin.x, 2) + Math.pow(y - coin.y, 2));
+                if (distToCoin < 60) {
+                    valid = false;
+                    break;
+                }
+            }
+
+            attempts++;
+        } while (!valid && attempts < 50);
+
+        if (valid) {
+            coins.push({ id: i, x, y, collected: false });
+        }
+    }
+
+    return coins;
 }
 
 function startTimer(game, duration, callback) {
@@ -332,10 +424,84 @@ function handleMessage(ws, data) {
             case 'target_reached':
                 handleTargetReachedMsg(ws, msg);
                 break;
+
+            case 'collect_coin':
+                handleCoinCollect(ws, msg);
+                break;
+
+            case 'buy_powerup':
+                handleBuyPowerup(ws, msg);
+                break;
         }
     } catch (e) {
         console.error('Error handling message:', e);
     }
+}
+
+function handleCoinCollect(ws, msg) {
+    const game = games[ws.gameId];
+    if (!game) return;
+
+    const player = game.players.find(p => p.ws === ws);
+    if (!player) return;
+
+    // Only attackers can collect coins
+    if (player.team !== game.state.attackingTeam) return;
+    if (game.state.phase !== 'attack') return;
+
+    // Find the coin
+    const coin = game.coins.find(c => c.id === msg.coinId && !c.collected);
+    if (!coin) return;
+
+    // Mark as collected
+    coin.collected = true;
+    game.teamCoins[player.team]++;
+
+    // Broadcast to all players
+    broadcast(game, {
+        type: 'coin_collected',
+        coinId: msg.coinId,
+        playerId: player.id,
+        team: player.team,
+        teamCoins: game.teamCoins[player.team]
+    });
+
+    console.log(`${player.username} collected coin! Team ${player.team} now has ${game.teamCoins[player.team]} coins`);
+}
+
+function handleBuyPowerup(ws, msg) {
+    const game = games[ws.gameId];
+    if (!game) return;
+
+    const player = game.players.find(p => p.ws === ws);
+    if (!player) return;
+
+    const powerupId = msg.powerupId;
+    const powerup = POWERUPS[powerupId];
+
+    if (!powerup) return;
+
+    // Check if team can afford it
+    const team = player.team;
+    if (game.teamCoins[team] < powerup.cost) return;
+
+    // Check if already purchased this round
+    if (game.activePowerups[team].includes(powerupId)) return;
+
+    // Deduct cost and activate
+    game.teamCoins[team] -= powerup.cost;
+    game.activePowerups[team].push(powerupId);
+
+    // Broadcast to all players
+    broadcast(game, {
+        type: 'powerup_purchased',
+        powerupId,
+        team,
+        teamCoins: game.teamCoins[team],
+        activePowerups: game.activePowerups[team]
+    });
+
+    console.log(`Team ${team} purchased ${powerup.name}! Remaining coins: ${game.teamCoins[team]}`);
 }
 
 function handleDraw(ws, msg) {
