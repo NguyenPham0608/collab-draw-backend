@@ -386,6 +386,14 @@ function handleLineComplete(ws, msg) {
             game.lines.permanent.push(msg.line);
         }
     }
+
+    // Broadcast to other players so they can see completed lines
+    broadcast(game, {
+        type: 'line_complete',
+        playerId: player.id,
+        line: msg.line,
+        inkType: msg.inkType
+    }, ws);
 }
 
 function handleStunned(ws, msg) {
