@@ -321,6 +321,10 @@ function handleMessage(ws, data) {
                 handleStunned(ws, msg);
                 break;
 
+            case 'explosion':
+                handleExplosion(ws, msg);
+                break;
+
             case 'target_reached':
                 handleTargetReachedMsg(ws, msg);
                 break;
@@ -402,8 +406,80 @@ function handleStunned(ws, msg) {
 
     broadcast(game, {
         type: 'player_stunned',
-        playerId: msg.playerId
+        playerId: msg.playerId,
+        collisionPoint: msg.collisionPoint
     }, ws);
+}
+
+function handleExplosion(ws, msg) {
+    const game = games[ws.gameId];
+    if (!game) return;
+
+    const player = game.players.find(p => p.ws === ws);
+    if (!player) return;
+
+    // Broadcast explosion to all other players so they can update their line arrays
+    broadcast(game, {
+        type: 'explosion',
+        playerId: player.id,
+        point: msg.point,
+        radius: msg.radius
+    }, ws);
+
+    // Also update server-side line storage
+    explodeServerLines(game, msg.point, msg.radius);
+}
+
+function explodeServerLines(game, point, radius) {
+    // Helper to calculate distance
+    const dist = (p1, p2) => Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
+
+    // Process permanent lines
+    const newPermanent = [];
+    for (const line of game.lines.permanent) {
+        const segments = splitLineByExplosion(line, point, radius, dist);
+        newPermanent.push(...segments);
+    }
+    game.lines.permanent = newPermanent;
+
+    // Process fading lines
+    const newFading = [];
+    for (const line of game.lines.fading) {
+        const segments = splitLineByExplosion(line, point, radius, dist);
+        newFading.push(...segments);
+    }
+    game.lines.fading = newFading;
+}
+
+function splitLineByExplosion(line, explosionPoint, radius, distFunc) {
+    const points = line.points;
+    const remainingSegments = [];
+    let currentSegment = [];
+
+    for (let i = 0; i < points.length; i++) {
+        const d = distFunc(points[i], explosionPoint);
+
+        if (d > radius) {
+            currentSegment.push(points[i]);
+        } else {
+            if (currentSegment.length >= 2) {
+                remainingSegments.push({
+                    ...line,
+                    points: [...currentSegment]
+                });
+            }
+            currentSegment = [];
+        }
+    }
+
+    if (currentSegment.length >= 2) {
+        remainingSegments.push({
+            ...line,
+            points: currentSegment
+        });
+    }
+
+    return remainingSegments;
 }
 
 function handleTargetReachedMsg(ws, msg) {
