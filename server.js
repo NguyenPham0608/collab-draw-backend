@@ -325,6 +325,10 @@ function handleMessage(ws, data) {
                 handleExplosion(ws, msg);
                 break;
 
+            case 'attacker_reset':
+                handleAttackerReset(ws, msg);
+                break;
+
             case 'target_reached':
                 handleTargetReachedMsg(ws, msg);
                 break;
@@ -487,6 +491,25 @@ function handleTargetReachedMsg(ws, msg) {
     if (!game) return;
 
     handleTargetReached(game, msg.playerId);
+}
+
+function handleAttackerReset(ws, msg) {
+    const game = games[ws.gameId];
+    if (!game) return;
+
+    const player = game.players.find(p => p.ws === ws);
+    if (!player) return;
+
+    // Clear this attacker's path on server
+    if (game.attackerPaths[player.id]) {
+        game.attackerPaths[player.id] = { points: [], maxDistance: 0 };
+    }
+
+    // Broadcast to other players
+    broadcast(game, {
+        type: 'attacker_reset',
+        playerId: player.id
+    }, ws);
 }
 
 // ============================================
